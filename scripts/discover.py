@@ -241,10 +241,29 @@ def evaluate(job, profile, skill_terms):
     location = job['location'].lower()
     full = title + ' ' + desc
 
-    if not re.search(
-        r'\b(intern(ship)?|co[ -]?op)\b',
-        title
-    ):
+    student_terms = (
+        r'\b(intern(ship)?|co[ -]?op|'
+        r'industrial placement|student engineer|'
+        r'undergraduate research|working student|'
+        r'summer engineering program|'
+        r'engineering placement)\b'
+    )
+
+    title_matches = re.search(
+        student_terms, title
+    )
+
+    # Description matches require explicit student context.
+    description_matches = (
+        re.search(r'\b(internship|co[ -]?op)\b', desc)
+        and re.search(
+            r'\b(currently enrolled|undergraduate|'
+            r'returning to school|university student)\b',
+            desc
+        )
+    )
+
+    if not title_matches and not description_matches:
         return None
 
     # High-volume discovery:

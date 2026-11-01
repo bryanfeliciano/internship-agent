@@ -247,7 +247,41 @@ def evaluate(job, profile, skill_terms):
     ):
         return None
 
-    if not any(term in title for term in ROLE_TERMS):
+    # High-volume discovery:
+    # Accept internships across a broader technical range.
+    # Scores determine priority, not automatic rejection.
+    expanded_roles = ROLE_TERMS + [
+        'engineering',
+        'engineer',
+        'software',
+        'computer',
+        'systems',
+        'electronic',
+        'mechanical',
+        'manufacturing',
+        'industrial',
+        'quality',
+        'reliability',
+        'validation',
+        'verification',
+        'integration',
+        'test',
+        'testing',
+        'research',
+        'development',
+        'technology',
+        'technical',
+        'field service',
+        'instrumentation',
+        'energy',
+        'battery',
+        'renewable',
+        'grid',
+        'data engineering',
+        'cybersecurity'
+    ]
+
+    if not any(term in title for term in expanded_roles):
         return None
 
     if re.search(
