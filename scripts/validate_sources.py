@@ -1,0 +1,224 @@
+
+"""Validate and expand internship job-board sources safely."""
+
+import json
+import shutil
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCES = ROOT / "private" / "sources.json"
+BACKUP_DIR = ROOT / "data" / "backups"
+
+# Candidate identifiers are unverified until the API responds.
+# These can be expanded without changing discover.py.
+CANDIDATE_FILE = ROOT / "private" / "employer_candidates.json"
+
+def load_candidates():
+    data = json.loads(
+        CANDIDATE_FILE.read_text(encoding="utf-8-sig")
+    )
+    return data["candidates"]
+
+CANDIDATES = load_candidates()
+
+
+def fetch_json(url):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "InternshipAgentSourceValidator/1.0",
+            "Accept": "application/json"
+        }
+    )
+
+    with urllib.request.urlopen(
+        request, timeout=15
+    ) as response:
+        return json.load(response)
+
+
+def validate(candidate):
+    platform = candidate["platform"]
+    token = urllib.parse.quote(candidate["token"], safe="")
+
+    if platform == "greenhouse":
+        url = (
+            "https://boards-api.greenhouse.io/v1/boards/"
+            f"{token}/jobs"
+        )
+
+        result = fetch_json(url)
+
+        if not isinstance(result, dict):
+            raise ValueError("Invalid Greenhouse response")
+
+        jobs = result.get("jobs")
+
+        if not isinstance(jobs, list):
+            raise ValueError("Missing jobs list")
+
+        return len(jobs)
+
+    if platform == "lever":
+        url = (
+            f"https://api.lever.co/v0/postings/{token}"
+            "?mode=json&limit=100"
+        )
+
+        result = fetch_json(url)
+
+        if not isinstance(result, list):
+            raise ValueError("Invalid Lever response")
+
+        return len(result)
+
+    raise ValueError("Unsupported platform")
+
+
+def main():
+    if not SOURCES.exists():
+        print("ERROR: sources.json not found.")
+        return
+
+    config = json.loads(
+        SOURCES.read_text(encoding="utf-8-sig")
+    )
+
+    config.setdefault("greenhouse", [])
+    config.setdefault("lever", [])
+
+    existing = {
+        ("greenhouse", entry["board_token"].lower())
+        for entry in config["greenhouse"]
+    }
+
+    existing.update({
+        ("lever", entry["site"].lower())
+        for entry in config["lever"]
+    })
+
+    added = []
+    failed = []
+
+    print("\nEMPLOYER SOURCE VALIDATOR")
+    print("=" * 55)
+
+    for candidate in CANDIDATES:
+        company = candidate["company"]
+        platform = candidate["platform"]
+        token = candidate["token"]
+
+        if (platform, token.lower()) in existing:
+            print(f"[EXISTS] {company}")
+            continue
+
+        try:
+            count = validate(candidate)
+
+            # A valid empty board does not establish that
+            # the intended employer was identified.
+            if count == 0:
+                print(f"[REVIEW] {company}: empty board")
+                failed.append((company, "Empty board"))
+                continue
+
+            # API success establishes an accessible board,
+            # not necessarily the intended company's identity.
+            print(
+                f"[CANDIDATE] {company}: "
+                f"{count} published positions"
+            )
+
+            added.append(candidate)
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OSError
+        ) as error:
+            print(f"[UNAVAILABLE] {company}: {error}")
+            failed.append((company, str(error)))
+
+    if not added:
+        print("\nNo new accessible boards discovered.")
+        return
+
+    print("\nPOTENTIAL NEW SOURCES")
+    print("-" * 55)
+
+    for index, candidate in enumerate(added, 1):
+        print(
+            f"{index}. {candidate['company']} "
+            f"({candidate['platform']})"
+        )
+
+    print(
+        "\nIMPORTANT: Verify that each board belongs "
+        "to the named employer before enabling it."
+    )
+
+    approval = input(
+        "\nHave you verified the listed employers? "
+        "Type YES to add all, or anything else to cancel: "
+    ).strip()
+
+    if approval != "YES":
+        print("Cancelled. No configuration changed.")
+        return
+
+    for candidate in added:
+        platform = candidate["platform"]
+
+        if platform == "greenhouse":
+            config["greenhouse"].append({
+                "company": candidate["company"],
+                "board_token": candidate["token"],
+                "enabled": True
+            })
+        else:
+            config["lever"].append({
+                "company": candidate["company"],
+                "site": candidate["token"],
+                "enabled": True
+            })
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now(timezone.utc).strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+
+    backup = BACKUP_DIR / f"sources_{stamp}.json"
+    shutil.copy2(SOURCES, backup)
+
+    temporary = SOURCES.with_name(
+        SOURCES.name + ".tmp"
+    )
+
+    try:
+        temporary.write_text(
+            json.dumps(config, indent=2) + "\n",
+            encoding="utf-8"
+        )
+        temporary.replace(SOURCES)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+    print("\nSOURCE CONFIGURATION UPDATED")
+    print(f"New sources: {len(added)}")
+    print(f"Unavailable/empty: {len(failed)}")
+    print(f"Backup: {backup}")
+    print(f"Configuration: {SOURCES}")
+    print("\nRun discover.py to search the expanded network.")
+
+
+if __name__ == "__main__":
+    main()

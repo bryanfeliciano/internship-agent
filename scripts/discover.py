@@ -1,0 +1,501 @@
+
+"""Discover and rank internships from configured Greenhouse and Lever boards."""
+import csv
+import html
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILE = ROOT / 'private' / 'object.json'
+SOURCES = ROOT / 'private' / 'sources.json'
+JOBS = ROOT / 'data' / 'jobs.csv'
+RANKED = ROOT / 'data' / 'ranked_internships.csv'
+
+FIELDS = [
+    'url', 'company', 'title', 'location', 'source',
+    'status', 'last_updated', 'notes', 'confirmation',
+    'score', 'match_status', 'matched_skills'
+]
+RANK_FIELDS = [
+    'score', 'match_status', 'matched_skills', 'url',
+    'company', 'title', 'location', 'source', 'notes'
+]
+ROLE_TERMS = [
+    'electrical', 'power', 'distribution', 'embedded',
+    'firmware', 'controls', 'control systems', 'automation',
+    'aerospace', 'robotics', 'hardware', 'systems test',
+    'test engineering', 'avionics', 'electronics',
+    'electromechanical', 'mechatronics'
+]
+STATES = {
+    'Texas': 'TX',
+    'Georgia': 'GA',
+    'Florida': 'FL',
+    'Nevada': 'NV'
+}
+
+
+def get_json(url):
+    request = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': 'InternshipDiscovery/1.0',
+            'Accept': 'application/json'
+        }
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        return json.load(response)
+
+
+def clean(value):
+    text = html.unescape(
+        re.sub(r'<[^>]+>', ' ', str(value or ''))
+    )
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def read_csv(path):
+    if not path.exists():
+        return []
+    with path.open('r', encoding='utf-8-sig', newline='') as file:
+        return list(csv.DictReader(file))
+
+
+def atomic_csv(path, fields, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.tmp')
+
+    with temp.open('w', encoding='utf-8', newline='') as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fields,
+            extrasaction='ignore'
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    temp.replace(path)
+
+
+def normalize_url(value):
+    parsed = urllib.parse.urlsplit((value or '').strip())
+    return urllib.parse.urlunsplit((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        parsed.path.rstrip('/'),
+        '',
+        ''
+    ))
+
+
+def retrieve_sources(config):
+    for entry in config.get('greenhouse', []):
+        if not entry.get('enabled', True):
+            continue
+
+        company = entry['company']
+        token = urllib.parse.quote(entry['board_token'], safe='')
+        url = (
+            f'https://boards-api.greenhouse.io/v1/boards/'
+            f'{token}/jobs?content=true'
+        )
+
+        try:
+            payload = get_json(url)
+
+            if not isinstance(payload.get('jobs'), list):
+                raise ValueError('Missing jobs array')
+
+            print(
+                f'[OK] Greenhouse {company}: '
+                f'{len(payload["jobs"])} postings'
+            )
+
+            for item in payload['jobs']:
+                yield {
+                    'url': item.get('absolute_url', ''),
+                    'company': company,
+                    'title': clean(item.get('title')),
+                    'location': clean(
+                        (item.get('location') or {}).get('name')
+                    ),
+                    'description': clean(item.get('content')),
+                    'source': 'greenhouse'
+                }
+
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(
+                f'[WARNING] Greenhouse {company}: {exc}',
+                file=sys.stderr
+            )
+
+    for entry in config.get('lever', []):
+        if not entry.get('enabled', True):
+            continue
+
+        company = entry['company']
+        site = urllib.parse.quote(entry['site'], safe='')
+        offset = 0
+
+        while True:
+            url = (
+                f'https://api.lever.co/v0/postings/{site}'
+                f'?mode=json&skip={offset}&limit=100'
+            )
+
+            try:
+                items = get_json(url)
+
+                if not isinstance(items, list):
+                    raise ValueError(
+                        'Unexpected Lever API response'
+                    )
+
+                print(
+                    f'[OK] Lever {company}: '
+                    f'{len(items)} postings at offset {offset}'
+                )
+
+                for item in items:
+                    categories = item.get('categories') or {}
+
+                    description = ' '.join([
+                        item.get('descriptionPlain', ''),
+                        item.get('additionalPlain', ''),
+                        ' '.join(
+                            clean(block.get('content'))
+                            for block in item.get('lists', [])
+                            if isinstance(block, dict)
+                        )
+                    ])
+
+                    yield {
+                        'url': item.get('hostedUrl', ''),
+                        'company': company,
+                        'title': clean(item.get('text')),
+                        'location': clean(
+                            categories.get('location')
+                        ),
+                        'description': clean(description),
+                        'source': 'lever'
+                    }
+
+                if len(items) < 100:
+                    break
+
+                offset += len(items)
+
+                if offset >= 2000:
+                    print(
+                        f'[WARNING] Lever {company}: '
+                        'stopped at 2000 results',
+                        file=sys.stderr
+                    )
+                    break
+
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                print(
+                    f'[WARNING] Lever {company}: {exc}',
+                    file=sys.stderr
+                )
+                break
+
+
+def terms_from_profile(profile):
+    skills = profile.get('technical_skills', {})
+    gathered = []
+
+    for group in skills.values():
+        if isinstance(group, list):
+            gathered.extend(group)
+
+    for experience in profile.get('experience', []):
+        gathered.extend(experience.get('skills', []))
+
+    for project in profile.get('projects', []):
+        gathered.extend(project.get('skills', []))
+
+    return list(dict.fromkeys(
+        s.strip()
+        for s in gathered
+        if isinstance(s, str) and len(s.strip()) > 1
+    ))
+
+
+def term_found(term, text):
+    return re.search(
+        r'(?<!\w)' + re.escape(term.lower()) + r'(?!\w)',
+        text
+    ) is not None
+
+
+def evaluate(job, profile, skill_terms):
+    title = job['title'].lower()
+    desc = job['description'].lower()
+    location = job['location'].lower()
+    full = title + ' ' + desc
+
+    if not re.search(
+        r'\b(intern(ship)?|co[ -]?op)\b',
+        title
+    ):
+        return None
+
+    # High-volume discovery:
+    # Accept internships across a broader technical range.
+    # Scores determine priority, not automatic rejection.
+    expanded_roles = ROLE_TERMS + [
+        'engineering',
+        'engineer',
+        'software',
+        'computer',
+        'systems',
+        'electronic',
+        'mechanical',
+        'manufacturing',
+        'industrial',
+        'quality',
+        'reliability',
+        'validation',
+        'verification',
+        'integration',
+        'test',
+        'testing',
+        'research',
+        'development',
+        'technology',
+        'technical',
+        'field service',
+        'instrumentation',
+        'energy',
+        'battery',
+        'renewable',
+        'grid',
+        'data engineering',
+        'cybersecurity'
+    ]
+
+    if not any(term in title for term in expanded_roles):
+        return None
+
+    if re.search(
+        r'\b(graduate students only|masters students only|'
+        r'phd students only|ph\.d\. required)\b',
+        full
+    ):
+        return None
+
+    matched = [
+        skill for skill in skill_terms
+        if term_found(skill, desc)
+    ]
+
+    score = 48 + min(24, 4 * len(matched))
+    reasons = []
+
+    if re.search(r'\b2027\b', full):
+        score += 12
+        reasons.append('2027 mentioned')
+    else:
+        reasons.append('year not verified')
+
+    if any(
+        term in title
+        for term in [
+            'electrical', 'power', 'embedded', 'firmware'
+        ]
+    ):
+        score += 8
+
+    if any(
+        re.search(
+            r'\b' + re.escape(state.lower()) + r'\b',
+            location
+        )
+        or re.search(
+            r'\b' + re.escape(abbr.lower()) + r'\b',
+            location
+        )
+        for state, abbr in STATES.items()
+        if state in profile.get(
+            'internship_preferences', {}
+        ).get('preferred_states', [])
+    ):
+        score += 8
+        reasons.append('preferred state')
+
+    elif location:
+        reasons.append(
+            'location/relocation requires review'
+        )
+    else:
+        reasons.append('location unspecified')
+
+    if any(
+        phrase in full
+        for phrase in [
+            'spring 2027',
+            'winter 2027',
+            'january 2027',
+            'spring semester 2027'
+        ]
+    ):
+        reasons.append(
+            'winter/spring availability requires confirmation'
+        )
+
+    if any(
+        phrase in full
+        for phrase in [
+            'must be enrolled in a master',
+            'must be enrolled in a graduate'
+        ]
+    ):
+        reasons.append(
+            'possible graduate enrollment requirement'
+        )
+
+    if '2028' in full and '2027' not in full:
+        reasons.append(
+            'check 2028 date/eligibility'
+        )
+
+    score = min(100, score)
+    settings = profile.get('matching', {})
+
+    review_threshold = int(
+        settings.get('review_score', 40)
+    )
+    minimum = int(
+        settings.get('minimum_score', 60)
+    )
+
+    if score < review_threshold:
+        return None
+
+    return {
+        'score': score,
+        'match_status': (
+            'match' if score >= minimum else 'review'
+        ),
+        'matched_skills': '; '.join(matched[:10]),
+        'notes': '; '.join(reasons)
+    }
+
+
+def main():
+    for path in [PROFILE, SOURCES]:
+        if not path.exists():
+            sys.exit(
+                f'Missing configuration: {path}'
+            )
+
+    profile = json.loads(
+        PROFILE.read_text(encoding='utf-8-sig')
+    )
+    sources = json.loads(
+        SOURCES.read_text(encoding='utf-8-sig')
+    )
+
+    skill_terms = terms_from_profile(profile)
+
+    existing = {
+        normalize_url(row.get('url')): row
+        for row in read_csv(JOBS)
+        if row.get('url')
+    }
+
+    ranked = []
+    discovered = 0
+    new = 0
+
+    now = datetime.now(timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%SZ'
+    )
+
+    seen = set()
+
+    for job in retrieve_sources(sources):
+        key = normalize_url(job['url'])
+
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        discovered += 1
+
+        result = evaluate(
+            job, profile, skill_terms
+        )
+
+        if result is None:
+            continue
+
+        if key in existing:
+            existing[key]['score'] = result['score']
+            existing[key]['match_status'] = result['match_status']
+            existing[key]['matched_skills'] = result['matched_skills']
+            continue
+
+        row = {
+            'url': job['url'],
+            'company': job['company'],
+            'title': job['title'],
+            'location': job['location'],
+            'source': job['source'],
+            'status': 'new',
+            'last_updated': now,
+            'notes': result['notes'],
+            'confirmation': '',
+            'score': result['score'],
+            'match_status': result['match_status'],
+            'matched_skills': result['matched_skills']
+        }
+
+        existing[key] = row
+        ranked.append({
+            **job,
+            **result
+        })
+
+        new += 1
+
+    atomic_csv(
+        JOBS,
+        FIELDS,
+        list(existing.values())
+    )
+
+    ranked.sort(
+        key=lambda row: row['score'],
+        reverse=True
+    )
+
+    atomic_csv(
+        RANKED,
+        RANK_FIELDS,
+        ranked
+    )
+
+    print(
+        f'\nScanned {discovered} unique postings; '
+        f'added {new} new matches.'
+    )
+
+    print(f'Saved {JOBS}')
+    print(f'Saved {RANKED}')
+
+    print(
+        'Previously known URLs were not '
+        'requeued or overwritten.'
+    )
+
+
+if __name__ == '__main__':
+    main()

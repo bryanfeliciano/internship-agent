@@ -1,0 +1,20 @@
+﻿# Private applicant information
+private/
+
+# Job databases and application results
+data/
+
+# Python temporary files
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Editor and operating system files
+.vscode/
+.DS_Store
+Thumbs.db
